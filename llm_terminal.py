@@ -14,15 +14,20 @@ class CommandProcessor:
     @staticmethod
     def extract_command(llm_response: str) -> str:
         """Extract actual command from LLM response"""
-        # Remove markdown code blocks
+        # Remove markdown code blocks and explanatory text
         command = re.sub(r'```(?:bash|shell)?\n?(.*?)\n?```', r'\1', llm_response, flags=re.DOTALL)
+        command = re.sub(r'Sure!.*?following command[s]?:?\s*', '', command, flags=re.DOTALL|re.IGNORECASE)
+        command = re.sub(r'Here.*?command[s]?:?\s*', '', command, flags=re.DOTALL|re.IGNORECASE)
+        command = re.sub(r'I can help.*?\s*', '', command, flags=re.DOTALL|re.IGNORECASE)
+        command = re.sub(r'Please.*?\s*', '', command, flags=re.DOTALL|re.IGNORECASE)
         
-        # Remove explanatory text (anything that's not the command)
+        # Get the first line that looks like a command
         lines = command.split('\n')
         for line in lines:
-            # Skip empty lines or lines that look like explanations
             line = line.strip()
             if line and not line.startswith('#') and not line.startswith('//') and ':' not in line:
+                # Remove numbered lists (e.g., "1. command")
+                line = re.sub(r'^\d+\.\s*', '', line)
                 command = line
                 break
         
@@ -38,6 +43,19 @@ class CommandProcessor:
         command = command.replace('\n', ' ').strip()
         return command
 
+    @staticmethod
+    def is_package_installation_command(command: str) -> bool:
+        """Check if the command is a package installation command"""
+        install_patterns = [
+            r'^pip\s+install',
+            r'^python\s+-m\s+pip\s+install',
+            r'^apt\s+install',
+            r'^apt-get\s+install',
+            r'^conda\s+install'
+        ]
+        return any(re.match(pattern, command) for pattern in install_patterns)
+
+
 class TerminalMind:
     def __init__(self, interactive_mode: bool = False):
         self.console = Console()
@@ -46,6 +64,21 @@ class TerminalMind:
         self.command_history = []
         self.context = {}
         self.command_processor = CommandProcessor()
+        self.environment_context = self._get_environment_context()
+
+    def _get_environment_context(self) -> Dict[str, str]:
+        """Get information about the current Python environment"""
+        try:
+            python_path = subprocess.run(['which', 'python'], capture_output=True, text=True).stdout.strip()
+            pip_path = subprocess.run(['which', 'pip'], capture_output=True, text=True).stdout.strip()
+            
+            return {
+                'python_path': python_path,
+                'pip_path': pip_path,
+                'is_venv': os.environ.get('VIRTUAL_ENV') is not None
+            }
+        except Exception:
+            return {}
 
     def execute_command(self, command: str) -> Tuple[bool, str]:
         """Execute a shell command and return the result"""
@@ -63,7 +96,7 @@ class TerminalMind:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=300
             )
             output = result.stdout.strip()
             self.command_history.append((command, output))
@@ -83,26 +116,42 @@ class TerminalMind:
             if context:
                 context_str = f"\nPrevious command output: {json.dumps(context)}\n"
                 
+            # Add environment context for package installation commands
+            if any(keyword in prompt.lower() for keyword in ['install', 'pip', 'package']):
+                env_str = f"\nEnvironment: Using {'virtual environment' if self.environment_context.get('is_venv') else 'system Python'}"
+                context_str += env_str
+                
             full_prompt = f"""Generate a bash command for the following task: {prompt}
             {context_str}
             Requirements:
             - Return ONLY the command itself, no explanations or comments
             - Do not include backticks, dollar signs, or markdown formatting
-            - Do not include any explanatory text
+            - Do not include any explanatory text or numbered lists
+            - Never include phrases like "Here's the command" or "I can help"
             - Use relative paths unless absolute paths are necessary
-            - For .gitignore-aware operations, use: 'find . -type d -not -path "./.*"' or 'git ls-files'
-            - If previous command output is provided, use it to make informed decisions
+            - For package installation, use the appropriate pip command with --upgrade
             
             Example good responses:
+            - pip install --upgrade numpy pandas torch
             - ls -la --color=auto
             - find . -type d -not -path "./.*"
-            - git ls-files --others --exclude-standard
             
-            Example bad response: Here's a command to list files: `ls -la`
+            Example bad responses:
+            - Here's the command to install packages: pip install numpy
+            - 1. First run: pip install numpy
+            - Sure! Use this command: `pip install numpy`
             """
             
             response = self.llm.invoke(full_prompt)
             command = self.command_processor.extract_command(response.content)
+            
+            # For package installation, ensure we use the correct pip
+            if self.command_processor.is_package_installation_command(command):
+                if self.environment_context.get('is_venv'):
+                    command = f"pip install --upgrade {' '.join(command.split()[2:])}"
+                else:
+                    command = f"python -m pip install --upgrade {' '.join(command.split()[2:])}"
+            
             return command
             
         except Exception as e:
